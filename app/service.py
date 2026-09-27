@@ -680,10 +680,20 @@ def drift_budget_depletion(frm: float, budget: float) -> dict:
     逐插值区间推进：段内 bias 过零时先在解析零点拆分（|bias| 仅在拆分后的子段上
     才是线性函数），目标面积落入某子段时反解其累积二次式得到精确耗尽时点，
     不做固定步长采样。覆盖范围内未耗尽时 depleted_at 为 null。贡献按插值区间
-    裁剪到 [frm, 耗尽点或覆盖终点]，各段 absolute_bias_seconds 之和即 consumed
-    （同一循环内累加，无二次求和误差）。
+    裁剪到 [frm, 耗尽点或覆盖终点]，返回前把末段贡献按 consumed−此前各段之和
+    做一次 ULP 对齐，保证各段 absolute_bias_seconds 之和与 consumed 严格相等。
+
+    面积一律走 calibration._linear_area 的不溢出求法（先均值后乘时长），段总面积
+    真实溢出时为 Infinity——此时与有限 budget 比较只会得到“本段内耗尽”，真正的
+    耗尽时点仍由 time_to_accumulate 按缩放后的面积占比解析求出，是有限值；不经过
+    b0·b1/(b1−b0)、b² 等会先上溢再相减成 NaN 的中间步骤。预算本身为 NaN/±Infinity
+    属不可处理输入（422）；真实耗尽结果不可表示（耗尽时点或消耗值非有限）时同样
+    以 CalibrationError 拒绝（422），响应中不输出 NaN/Infinity。
     """
-    if not budget > 0:  # 同时拒绝 NaN
+    if not math.isfinite(budget):
+        # NaN/±Infinity 预算无法累积也无法表达 remaining：拒绝，不输出非有限 JSON
+        raise CalibrationError(f"budget ({budget}) must be a finite positive number")
+    if budget <= 0.0:
         raise InvalidBudgetError(f"budget ({budget}) must be positive")
     with closing(connect()) as conn:
         bounds = conn.execute("SELECT MIN(ts) AS lo, MAX(ts) AS hi FROM observations").fetchone()
@@ -708,25 +718,66 @@ def drift_budget_depletion(frm: float, budget: float) -> dict:
             bb = calibration.interpolate(b, row["t_start"], row["bias_start"], row["t_end"], row["bias_end"])
             # 过零点拆分：|bias| 在每个子段上才是线性函数，面积才可解析反解
             subs = calibration.abs_subsegments(a, ba, b, bb)
-            interval_area = 0.0
-            for _s, abs_bs, _e, abs_be in subs:
-                interval_area += (abs_bs + abs_be) * 0.5 * (_e - _s)
+            # 各子段面积走不溢出求法（真实总面积可能为 Infinity，仅用于与预算比较）
+            sub_areas = [
+                calibration._linear_area(abs_bs, abs_be, e - s)
+                for s, abs_bs, e, abs_be in subs
+            ]
+            interval_area = sum(sub_areas)
             if consumed + interval_area < budget:
+                # 注：interval_area 为 Infinity 时本比较恒为 False，直接落入耗尽分支，
+                # consumed 不会被 Infinity 污染
                 consumed += interval_area
+                contributions.append({
+                    "t_start": a,
+                    "t_end": b,
+                    "start_iso": epoch_to_iso(a),
+                    "end_iso": epoch_to_iso(b),
+                    "bias_start": ba,
+                    "bias_end": bb,
+                    "absolute_bias_seconds": interval_area,
+                })
+                continue
+            # 预算在本区间内耗尽：逐子段定位目标面积，反解线性函数积分。
+            # target 为本区间起点尚需累积的面积（固定值，不做“剩余再减”以避免
+            # 大数相减在接缝处丢精度）；cum 为逐子段累计面积，子段面积与累计过程
+            # 都走同一套不溢出求法，故耗尽点恰在接缝时 target == cum+sub_area 可直接
+            # 严格比较，不需要容差。
+            target = budget - consumed
+            cum = 0.0
+            target_i = len(subs) - 1
+            for i, sub_area in enumerate(sub_areas):
+                if i + 1 < len(subs) and target > cum + sub_area:
+                    cum += sub_area
+                    continue
+                target_i = i  # 耗尽点落在本子段（含恰在子段尾端/过零接缝）
+                break
+            s, abs_bs, e, abs_be = subs[target_i]
+            sub_area = sub_areas[target_i]
+            needed = target - cum
+            if needed <= 0.0:
+                # 防御：耗尽点恰落在本子段起点（前一子段尾端/过零接缝）
+                depleted_at = s
+            # 耗尽点恰在子段尾端点（含过零接缝）时 needed == sub_area，直接取端点，
+            # 不在高度为 0 的端点子段上反解
+            elif needed >= sub_area:
+                depleted_at = e
             else:
-                # 预算在本区间内耗尽：逐子段定位目标面积，反解线性函数积分
-                remaining = budget - consumed
-                for i, (s, abs_bs, e, abs_be) in enumerate(subs):
-                    sub_area = (abs_bs + abs_be) * 0.5 * (e - s)
-                    if i + 1 < len(subs) and remaining > sub_area:
-                        remaining -= sub_area
-                        continue
-                    depleted_at = s + calibration.time_to_accumulate(abs_bs, abs_be, e - s, remaining)
-                    break
-                b = depleted_at
-                bb = calibration.interpolate(b, row["t_start"], row["bias_start"], row["t_end"], row["bias_end"])
-                interval_area = budget - consumed
-                consumed = budget
+                offset = calibration.time_to_accumulate(abs_bs, abs_be, e - s, needed)
+                depleted_at = s + offset
+                # needed > 0 时真实耗尽点严格在子段内部；若时间原点 s 过大
+                # （如 1.7e9）使 offset 不足一个 ULP、depleted_at 回退成 s，则真实
+                # 时点在 float 下不可表示：按不可表示拒绝（422），不输出时长为 0
+                # 却带正消耗、consumed 与分段对不齐的结果
+                if depleted_at <= s:
+                    raise CalibrationError(
+                        "drift budget depletion timestamp is not representable as a finite float "
+                        f"(depletion offset {offset} is below the time resolution at {s})"
+                    )
+            b = depleted_at
+            bb = calibration.interpolate(b, row["t_start"], row["bias_start"], row["t_end"], row["bias_end"])
+            interval_area = budget - consumed
+            consumed = budget
             contributions.append({
                 "t_start": a,
                 "t_end": b,
@@ -736,9 +787,39 @@ def drift_budget_depletion(frm: float, budget: float) -> dict:
                 "bias_end": bb,
                 "absolute_bias_seconds": interval_area,
             })
-            if depleted_at is not None:
-                break
-        return {
+            break
+        consumed = _ensure_finite_budget_result(consumed, "consumed budget")
+        if depleted_at is not None:
+            depleted_at = _ensure_finite_budget_result(depleted_at, "depletion timestamp")
+        # 对齐：各分段 absolute_bias_seconds 的逐项之和必须与 consumed 严格相等
+        # （响应承诺“贡献值之和即 consumed”，客户端用普通逐项加法核对）。各段面积
+        # 独立计算后，逐项重算之和可能与 consumed 相差一两个 ULP。做法：选一个枢轴段
+        # j，令其贡献 = consumed − 枢轴前各段（按客户端顺序逐项相加的前缀和）
+        # − 枢轴后各段之和；此时枢轴值与其前缀同量级（Sterbenz：|C−P| 不超过该值
+        # 的 2 倍），P+枢轴值可无舍入还原，逐项之和严格等于 consumed。从末段向前
+        # 找第一个满足条件的枢轴（数学上必然存在，j=0 即退化为 consumed−后缀和）。
+        # 未耗尽时 consumed 直接取逐项之和（各段面积本就是真实累计值）。
+        if contributions:
+            values = [c["absolute_bias_seconds"] for c in contributions]
+            if depleted_at is not None and sum(values) != consumed:
+                aligned = None
+                for j in range(len(values) - 1, -1, -1):
+                    prefix = 0.0
+                    for v in values[:j]:
+                        prefix += v
+                    pivot = consumed - prefix - sum(values[j + 1:])
+                    check = prefix + pivot
+                    for v in values[j + 1:]:
+                        check += v
+                    if check == consumed:
+                        aligned = values[:j] + [pivot] + values[j + 1:]
+                        break
+                values = aligned
+                for contrib, value in zip(contributions, values):
+                    contrib["absolute_bias_seconds"] = value
+            elif depleted_at is None:
+                consumed = sum(values)
+        result = {
             "from": frm,
             "from_iso": epoch_to_iso(frm),
             "budget": budget,
@@ -750,6 +831,29 @@ def drift_budget_depletion(frm: float, budget: float) -> dict:
             "coverage_end_iso": epoch_to_iso(hi),
             "contributions": contributions,
         }
+        if not math.isfinite(result["remaining"]):
+            raise CalibrationError(
+                "drift budget depletion result is not representable as a finite float "
+                "(remaining budget overflows)"
+            )
+        for contrib in contributions:
+            for key in ("t_start", "t_end", "bias_start", "bias_end", "absolute_bias_seconds"):
+                _ensure_finite_budget_result(contrib[key], f"contribution {key}")
+        return result
+
+
+def _ensure_finite_budget_result(value: float, what: str) -> float:
+    """耗尽分析的真实结果超出 float 上界（不可表示）时拒绝为 422。
+
+    正常路径下预算与耗尽时点都有限，时间戳来自可转换为 UTC 日期的观测时点；
+    此检查为最后防线，保证响应中绝不出现 NaN/Infinity。
+    """
+    if not math.isfinite(value):
+        raise CalibrationError(
+            f"drift budget depletion result ({what}) overflows to a non-finite value; "
+            "the true result is not representable as a finite float"
+        )
+    return value
 
 
 # ---------- 漂移稳定窗口分析 ----------

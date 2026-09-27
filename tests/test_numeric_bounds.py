@@ -722,3 +722,177 @@ def test_segment_total_avoids_intermediate_overflow():
     # 常规值与逐项累加一致
     assert total([2000.0, 1000.0]) == 3000.0
     assert total([2000.0, 1250.0]) == 3250.0
+
+
+# ---------- GET /drift-budget-depletion：极值偏差段上的耗尽时点 ----------
+
+def test_budget_pure_abs_subsegments_extreme_crossing_is_finite():
+    from app.calibration import abs_subsegments, _linear_area
+
+    # 1e308 → −1e308（两秒区间）：过零点必须是 t=1001 的有限数，子段面积各 5e307
+    subs = abs_subsegments(1000.0, 1e308, 1002.0, -1e308)
+    assert len(subs) == 2
+    for quad in subs:
+        assert all(math.isfinite(v) for v in quad)
+    (s0, h0, e0, z0), (s1, z1, e1, h1) = subs
+    assert (s0, e1) == (1000.0, 1002.0)
+    assert e0 == s1 == 1001.0 and (z0, z1) == (0.0, 0.0)
+    assert h0 == h1 == 1e308
+    assert _linear_area(h0, z0, e0 - s0) == 5e307
+    assert _linear_area(z1, h1, e1 - s1) == 5e307
+
+
+def test_budget_pure_time_to_accumulate_extreme_descending():
+    # 1e308 经 1 秒线性降到 0：预算 1e307（面积占比 0.2）的真实耗尽时长
+    # 为 (1−√0.8)≈0.105572809 秒；旧实现 abs_b0²+2k·area 先溢出成 Infinity，
+    # 判别式被顶为 0，按线性误返回 0.2 秒
+    from app.calibration import time_to_accumulate
+
+    offset = time_to_accumulate(1e308, 0.0, 1.0, 1e307)
+    assert math.isfinite(offset)
+    assert offset == pytest.approx(1.0 - math.sqrt(0.8), rel=1e-12)
+
+
+def test_budget_pure_time_to_accumulate_overflowing_total_still_finite():
+    # 段总面积 1e308×30 = 3e309 超出 float 上界，但 1e307 预算的耗尽时长仍可表示
+    from app.calibration import time_to_accumulate
+
+    assert time_to_accumulate(1e308, 1e308, 30.0, 1e307) == pytest.approx(0.1)
+    # 从 0 升到 1e308、持续 1e300 秒（总面积溢出）：耗尽占比 p=√r
+    offset = time_to_accumulate(0.0, 1e308, 1e300, 1e307)
+    assert math.isfinite(offset) and offset > 0.0
+
+
+def test_budget_pure_time_to_accumulate_ordinary_values_match_quadratic():
+    from app.calibration import time_to_accumulate
+
+    # 与直接解析二次式（稳定形式）逐值对照
+    def analytic(h0, h1, duration, area):
+        total = 0.5 * (h0 + h1) * duration
+        r = area / total
+        u = h1 / (h0 + h1)
+        c = 1.0 - u
+        p = r / (c + math.sqrt(max(0.0, c * c + (2.0 * u - 1.0) * r)))
+        return p * duration
+
+    for h0, h1, duration in [
+        (1.0, 3.0, 1000.0), (3.0, 1.0, 750.0), (2.0, 2.0, 500.0),
+        (0.0, 2.0, 1000.0), (5.0, 0.0, 10.0),
+    ]:
+        total = 0.5 * (h0 + h1) * duration
+        for frac in (0.01, 0.25, 0.5, 0.75, 0.99, 1.0):
+            area = frac * total
+            got = time_to_accumulate(h0, h1, duration, area)
+            assert got == pytest.approx(analytic(h0, h1, duration, area), rel=1e-11)
+
+
+@pytest.fixture()
+def budget_extreme_points(client):
+    """bias：1000 → +1e308，1002 → −1e308（两秒区间，t=1001 过零）。"""
+    big = 1e308
+    make_observation(client, ts=1000.0, reference=0.0, tolerance=0.0,
+                     readings=[-big, -big, -big])
+    make_observation(client, ts=1002.0, reference=0.0, tolerance=0.0,
+                     readings=[big, big, big])
+    return client
+
+
+def test_budget_depletion_extreme_crossing_finite_and_correct(budget_extreme_points):
+    resp = budget_extreme_points.get(
+        "/drift-budget-depletion", params={"from": 1000.0, "budget": 1e307}
+    )
+    assert resp.status_code == 200, resp.text
+    assert "Infinity" not in resp.text and "NaN" not in resp.text
+    body = resp.json()
+    expected_offset = 1.0 - math.sqrt(0.8)
+    assert body["depleted_at"] == pytest.approx(1000.0 + expected_offset, rel=1e-12)
+    assert body["depleted_at"] == pytest.approx(1000.105572809, abs=1e-9)
+    assert body["consumed"] == pytest.approx(1e307)
+    assert body["remaining"] == pytest.approx(0.0)
+    contribs = body["contributions"]
+    assert len(contribs) == 1
+    assert contribs[0]["t_start"] == 1000.0
+    assert contribs[0]["t_end"] == pytest.approx(1000.0 + expected_offset, rel=1e-12)
+    assert contribs[0]["bias_start"] == pytest.approx(1e308)
+    assert math.isfinite(contribs[0]["bias_end"])
+    assert contribs[0]["absolute_bias_seconds"] == pytest.approx(1e307)
+    # 贡献值之和与 consumed 严格对齐
+    assert sum(c["absolute_bias_seconds"] for c in contribs) == body["consumed"]
+
+
+def test_budget_depletion_extreme_full_budget_ends_at_crossing_then_end(budget_extreme_points):
+    # 预算 5e307：恰在前半三角形终点 t=1001（过零点）耗尽
+    body = budget_extreme_points.get(
+        "/drift-budget-depletion", params={"from": 1000.0, "budget": 5e307}
+    ).json()
+    assert body["depleted_at"] == pytest.approx(1001.0)
+    assert sum(c["absolute_bias_seconds"] for c in body["contributions"]) == body["consumed"]
+    # 预算 1e308：两三角形总面积，恰在覆盖终点 t=1002 耗尽
+    body = budget_extreme_points.get(
+        "/drift-budget-depletion", params={"from": 1000.0, "budget": 1e308}
+    ).json()
+    assert body["depleted_at"] == pytest.approx(1002.0)
+    assert body["remaining"] == pytest.approx(0.0)
+    assert sum(c["absolute_bias_seconds"] for c in body["contributions"]) == body["consumed"]
+
+
+def test_budget_depletion_extreme_not_depleted(budget_extreme_points):
+    body = budget_extreme_points.get(
+        "/drift-budget-depletion", params={"from": 1000.0, "budget": 1.5e308}
+    ).json()
+    assert body["depleted_at"] is None
+    assert body["consumed"] == pytest.approx(1e308)
+    assert body["remaining"] == pytest.approx(0.5e308)
+    assert sum(c["absolute_bias_seconds"] for c in body["contributions"]) == body["consumed"]
+    for contrib in body["contributions"]:
+        assert math.isfinite(contrib["bias_start"]) and math.isfinite(contrib["bias_end"])
+
+
+def test_budget_depletion_rejects_non_finite_budget(budget_extreme_points):
+    for bad in ("nan", "inf", "-inf"):
+        resp = budget_extreme_points.get(
+            "/drift-budget-depletion", params={"from": 1000.0, "budget": bad}
+        )
+        assert resp.status_code == 422, bad
+        assert "Infinity" not in resp.text and "NaN" not in resp.text
+
+
+def test_budget_depletion_finite_non_positive_budget_still_400(budget_extreme_points):
+    resp = budget_extreme_points.get(
+        "/drift-budget-depletion", params={"from": 1000.0, "budget": 0.0}
+    )
+    assert resp.status_code == 400
+
+
+def test_budget_depletion_unrepresentable_instant_returns_422(client):
+    # 时间原点 1.7e9（约 1 秒≈5e8 ULP）：1e308 偏差消耗 1e100 预算的真实时长
+    # 不足一个 ULP，耗尽时点在 float 下不可表示 → 422，不输出时长为 0 却带正消耗
+    big = 1e308
+    t0 = 1.7e9
+    make_observation(client, ts=t0, reference=0.0, tolerance=0.0,
+                     readings=[-big, -big, -big])
+    make_observation(client, ts=t0 + 2.0, reference=0.0, tolerance=0.0,
+                     readings=[big, big, big])
+    resp = client.get("/drift-budget-depletion", params={"from": t0, "budget": 1e100})
+    assert resp.status_code == 422
+    assert "not representable" in resp.json()["detail"]
+    # 可表示的预算仍返回精确时点
+    ok = client.get("/drift-budget-depletion", params={"from": t0, "budget": 1e307})
+    assert ok.status_code == 200
+    assert ok.json()["depleted_at"] > t0
+
+
+def test_budget_depletion_overflowing_segment_area_representable(client):
+    # 1e308 恒定偏差持续 30 秒：真实段面积 3e309 超出 float 上界，但 1e307 预算
+    # 的耗尽时点（t=0.1）仍可表示，旧路径在面积 Infinity 后无法继续解析
+    big = 1e308
+    make_observation(client, ts=0.0, reference=0.0, tolerance=0.0,
+                     readings=[-big, -big, -big])
+    make_observation(client, ts=30.0, reference=0.0, tolerance=0.0,
+                     readings=[-big, -big, -big])
+    resp = client.get("/drift-budget-depletion", params={"from": 0.0, "budget": 1e307})
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["depleted_at"] == pytest.approx(0.1)
+    assert body["consumed"] == pytest.approx(1e307)
+    assert sum(c["absolute_bias_seconds"] for c in body["contributions"]) == body["consumed"]

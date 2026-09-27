@@ -93,6 +93,19 @@ def interpolate(t: float, t0: float, b0: float, t1: float, b1: float) -> float:
     return (1.0 - w) * b0 + w * b1
 
 
+def _cross_fraction(h0: float, h1: float) -> float:
+    """过零点时长占比 h0/(h0+h1)（h0、h1 为端点偏差的非负绝对值）。
+
+    h0+h1 有限时直接相除；h0+h1 会溢出（两端都接近 float 上界）时，先把两者
+    各自减半再求比例（比值不变），保持结果为 (0,1) 内的有限数——直接用
+    t0 − b0·Δt/(b1−b0) 反算过零点会先在 b1−b0 处溢出为 ±Infinity，
+    再由 Infinity−Infinity 得到 NaN 时点。
+    """
+    if math.isfinite(h0 + h1):
+        return h0 / (h0 + h1)
+    return (h0 * 0.5) / (h0 * 0.5 + h1 * 0.5)
+
+
 def integrate_segment(t0: float, b0: float, t1: float, b1: float) -> tuple[float, float]:
     """对线性段 (t0, b0)-(t1, b1) 下的面积做解析积分，返回 (signed, absolute)。
 
@@ -114,10 +127,7 @@ def integrate_segment(t0: float, b0: float, t1: float, b1: float) -> tuple[float
     signed = _mean_no_overflow(b0, b1) * dt
     if (b0 < 0 < b1) or (b1 < 0 < b0):  # 严格异号：段内恰有一个零点，按解析交点拆分
         h0, h1 = abs(b0), abs(b1)
-        if math.isfinite(h0 + h1):
-            frac = h0 / (h0 + h1)                # 零点距 t0 的时长占比 ∈ (0, 1)
-        else:  # |b0|+|b1| 溢出（均接近 float 上界）：各自减半再求比例，比值不变
-            frac = (h0 * 0.5) / (h0 * 0.5 + h1 * 0.5)
+        frac = _cross_fraction(h0, h1)      # 零点距 t0 的时长占比 ∈ (0,1)
         base0 = frac * dt                        # 过零点前半段的底边长
         absolute = h0 * 0.5 * base0 + h1 * 0.5 * (dt - base0)
     else:  # 同号或端点触零：不变号
@@ -125,15 +135,34 @@ def integrate_segment(t0: float, b0: float, t1: float, b1: float) -> tuple[float
     return signed, absolute
 
 
+def _linear_area(h0: float, h1: float, duration: float) -> float:
+    """非负线性量从 h0 变到 h1、持续 duration 的积分面积（½·(h0+h1)·duration）。
+
+    中间步骤按“先均值后乘时长”且均值走 _mean_no_overflow 求法：两端同号且
+    都接近 float 上界时 h0+h1 会先溢出为 Infinity，直接 (h0+h1)·Δt/2 会把
+    本可表示的面积（如 1e308 恒值持续 1 秒）误算成 Infinity，甚至在其它路径
+    上由 Infinity−Infinity 产生 NaN。真实面积超出 float 上界时返回 Infinity，
+    由调用方按语义比较或拒绝（422）。
+    """
+    return _mean_no_overflow(h0, h1) * duration
+
+
 def abs_subsegments(t0: float, b0: float, t1: float, b1: float) -> list[tuple[float, float, float, float]]:
     """把线性 bias 段在解析过零点拆分，返回 |bias| 线性的子段 [(s, |b_s|, e, |b_e|)]。
 
-    端点严格异号时段内恰有一个零点 t* = t0 − b0·Δt/(b1−b0)，在 t* 处一分为二；
-    否则 |bias| 全程线性，原段直接返回。每个子段上 |bias| 都是线性函数，
-    其累积面积是时长的二次函数，可解析反解（见 time_to_accumulate）。
+    端点严格异号时段内恰有一个零点；零点位置按时长占比
+    frac = |b0|/(|b0|+|b1|) 计算（t_cross = t0 + frac·Δt），而不直接写
+    t0 − b0·Δt/(b1−b0)：两端偏差幅值接近 float 上界且异号时（如
+    1e308 → −1e308），b1−b0 会先溢出为 Infinity，反算时点变成
+    Infinity−Infinity = NaN，子段端点与面积随之全部 NaN。占比在
+    |b0|+|b1| 溢出时由 _cross_fraction 改走减半求法，t_cross 始终是
+    (t0, t1) 内的有限数。否则 |bias| 全程线性，原段直接返回。每个子段上
+    |bias| 都是线性函数，其累积面积是时长的二次函数，可解析反解
+    （见 time_to_accumulate）。
     """
     if b0 * b1 < 0:  # 严格异号：段内恰有一个零点
-        t_cross = t0 - b0 * (t1 - t0) / (b1 - b0)
+        frac = _cross_fraction(abs(b0), abs(b1))
+        t_cross = t0 + frac * (t1 - t0)
         return [(t0, abs(b0), t_cross, 0.0), (t_cross, 0.0, t1, abs(b1))]
     return [(t0, abs(b0), t1, abs(b1))]
 
@@ -141,19 +170,49 @@ def abs_subsegments(t0: float, b0: float, t1: float, b1: float) -> list[tuple[fl
 def time_to_accumulate(abs_b0: float, abs_b1: float, duration: float, area: float) -> float:
     """反解 |bias| 线性段的累积函数：从段首累积 area（|bias|·秒）所需的时长。
 
-    |bias| 从 abs_b0 线性变化到 abs_b1（斜率 k = (abs_b1 − abs_b0)/duration），
-    累积面积 A(Δt) = abs_b0·Δt + k·Δt²/2 是 Δt 的二次函数，解析求根：
-    k ≠ 0 时取数值稳定形式 Δt = 2·area / (abs_b0 + √(abs_b0² + 2k·area))，
-    k = 0 时退化为线性 Δt = area / abs_b0。全程解析解，不做固定步长采样。
-    调用前须保证 0 < area ≤ 段内总面积（段内 |bias| 不恒为零）；
-    判别式与结果做浮点误差钳制，area 恰等于段内总面积时返回 duration。
+    |bias| 从 abs_b0（记 h0）线性变化到 abs_b1（记 h1），段内总面积
+    T = (h0+h1)·duration/2。令端点占比 u = h1/(h0+h1)（c = 1−u）、
+    面积占比 r = area/T，时长占比 p = Δt/duration 满足
+
+        r = 2c·p + (2u−1)·p²  ⇔  (2u−1)·p² + 2c·p − r = 0，
+
+    取非负根并有理化（消去 u<1/2 时 √c²−c 的相消）：
+
+        p = r / (c + √(c² + (2u−1)·r))。
+
+    特例与之一致：h0=0（u=1）退化为 r=p² → p=√r；|bias| 恒定（u=1/2）
+    退化为 r=p；h1=0（u=0）为 p=1−√(1−r)=r/(1+√(1−r))。全程不出现
+    h0²、h1² 与 (h1−h0)·area：旧式 abs_b0² + 2k·area 在 1e308 等极值处
+    先在平方/乘积上溢出为 Infinity，使耗尽时点被误算——如 1e308 经 1 秒
+    线性降到 0（过零拆出的前半子段）、预算 1e307（r=0.2）的真实耗尽时长
+    为 (1−√0.8)≈0.10557 秒，旧式却把判别式顶到 0 而按线性返回 0.2 秒。
+
+    h0+h1 会溢出时把两端按 M=max(h0,h1) 缩放成 (h0/M, h1/M)：u 只依赖
+    两端之比，r = 2·area/((h0+h1)·duration) 改写成先除后乘的
+    2·(area/duration/M)/(h0/M + h1/M)，任何中间量都不超过 float 上界
+    （段总面积真实溢出时 r 仍为 (0,1) 内的有限小数，耗尽时点照常可解）。
+    全程解析解，不做固定步长采样。调用前须保证 area > 0 且不超过段内真实
+    总面积（段内 |bias| 不恒为零）；浮点误差把结果钳制回 [0,1]，area 恰
+    等于段内总面积（r=1）时返回 duration。
     """
-    k = (abs_b1 - abs_b0) / duration
-    if k == 0.0:  # |bias| 恒定：累积随时间线性增长
-        return area / abs_b0
-    discriminant = max(0.0, abs_b0 * abs_b0 + 2.0 * k * area)
-    offset = 2.0 * area / (abs_b0 + math.sqrt(discriminant))
-    return min(offset, duration)
+    m = max(abs_b0, abs_b1)
+    if m <= 0.0:
+        # |bias| 恒为零的子段不消耗预算，正常调用路径不会进入（area > 0）
+        return 0.0
+    u0, u1 = abs_b0 / m, abs_b1 / m          # 至少一个为 1，和 ∈ [1, 2]，不溢出
+    us = u0 + u1
+    u = u1 / us                               # 端点占比 ∈ [0, 1]，c = 1−u
+    # 面积占比：先除后乘，避免 (h0+h1)·duration / h0² 等中间乘积上溢
+    r = 2.0 * (area / duration / m) / us
+    if r <= 0.0:
+        return 0.0
+    if r >= 1.0:
+        return duration
+    c = 1.0 - u
+    radicand = c * c + (2.0 * u - 1.0) * r    # r∈(0,1) 时 ≥ u² ≥ 0，钳制仅防御舍入
+    p = r / (c + math.sqrt(max(0.0, radicand)))
+    p = min(1.0, max(0.0, p))
+    return p * duration
 
 
 def _above_threshold(t0: float, v0: float, t1: float, v1: float, limit: float) -> tuple[float, float] | None:

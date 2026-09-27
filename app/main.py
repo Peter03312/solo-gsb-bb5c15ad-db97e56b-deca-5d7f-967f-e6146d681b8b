@@ -313,13 +313,17 @@ def get_drift_budget_depletion(
     逐插值区间推进：段内 bias 过零时先在解析零点拆分（|bias| 仅在拆分后的子段上
     才是线性函数），目标面积落入某子段时反解其累积二次式，全程无固定步长采样。
     返回 depleted_at（覆盖范围内未耗尽为 null）、截至耗尽点（未耗尽时为覆盖终点）
-    的 consumed/remaining，以及按插值区间裁剪的分段贡献。from 越出覆盖范围或
-    budget ≤ 0 返回 400。
+    的 consumed/remaining，以及按插值区间裁剪的分段贡献。过零点、分段面积与首次
+    耗尽时点在真实结果可表示时均保持有限且正确（不做乘积/平方等中间上溢运算）；
+    budget 为 NaN/±Infinity 或真实耗尽结果不可表示时返回 422，响应不含
+    NaN/Infinity；from 越出覆盖范围或有限的 budget ≤ 0 返回 400。
     """
     try:
         return service.drift_budget_depletion(frm=from_, budget=budget)
     except (InvalidBudgetError, OutOfCoverageError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except CalibrationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
 @app.post("/calibration-schedules/plan", response_model=CalibrationSchedulePlanOut)
